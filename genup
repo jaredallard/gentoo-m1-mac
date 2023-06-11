@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+#
+# Updates a Gentoo install.
+#
+# Heavily inspired by genup by @sakaki:
+# https://github.com/sakaki-/genup/blob/master/genup
+
+set -euo pipefail
+
+# PROGNAME is the name of the program (user-facing)
+# Do not use to execute the program.
+PROGNAME="$(basename "$0")"
+# VERBOSITY is the verbosity level of the program.
+VERBOSITY=0
+DISPLAYED_GREETING=${DISPLAYED_GREETING:-0}
+
+## Logging
+# RESET resets all attributes.
+RESET="\033[0m"
+# YELLOW is the color code for yellow text.
+YELLOW="\033[0;33m"
+# RED is the color code for red text.
+RED="\033[0;31m"
+# GREEN is the color code for green text.
+GREEN="\033[0;32m"
+# PREFIXSTRING is the string that prefixes all output.
+PREFIXSTRING="* "
+# SHOWPREFIX is the string that prefixes all output from show().
+SHOWPREFIX="${GREEN}${PREFIXSTRING}${RESET}"
+SHOWSUFFIX=""
+
+## Command Line Options
+NO_PORTAGE_SYNC=0
+
+# show prints a message with support for verbosity levels.
+# Args:
+#   $1: The message to print.
+#   $2: The verbosity level required to print the message. (optional)
+show() {
+  local MESSAGE=${1:-""}
+  local VERBLEVEL=${2:-0}
+  if ((VERBOSITY >= VERBLEVEL)); then
+    echo -e "${SHOWPREFIX}${MESSAGE}${SHOWSUFFIX}"
+  fi
+}
+
+# warning is a function that prints a warning message to stderr.
+warning() {
+  echo -e "${YELLOW}${PREFIXSTRING}${PROGNAME}: Warning:${RESET} $*" >&2
+}
+
+# die prints an error message and exits with a non-zero exit code.
+die() {
+  echo
+  echo -e "${RED}${PREFIXSTRING}${PROGNAME}: Error:${RESET} $* - exiting" >&2
+  cleanup_and_exit_with_code 1
+}
+
+## Start of logical functions.
+
+trap_cleanup() {
+  trap - SIGHUP SIGQUIT SIGINT SIGTERM EXIT
+  die "Caught signal"
+}
+trap trap_cleanup SIGHUP SIGQUIT SIGINT SIGTERM EXIT
+
+# greeting prints a message about the current program.
+greeting() {
+  if [[ $DISPLAYED_GREETING -eq 1 ]]; then
+    return
+  fi
+  show "$PROGNAME: Gentoo Updater"
+}
+
+# cleanup_and_exit_with_code cleans up and exits with a given exit code.
+cleanup_and_exit_with_code() {
+  # add any cleanup code here
+  trap - EXIT
+  exit "$1"
+}
+
+ensure_portage_itself_is_up_to_date() {
+  show "Bringing Portage itself up to date..."
+  # don't fail on this, as an @world update may solve any blocks
+  emerge --oneshot --update sys-apps/portage ||
+    warning "Could not update Portage: proceeding anyway"
+}
+
+# update_portage_tree updates the portage tree. If eix-sync is available, it
+# will be used. Otherwise, emerge-webrsync will be used to update the portage
+# tree with emaint sync --auto being used to fill in any missing packages.
+update_portage_tree() {
+  if [[ $NO_PORTAGE_SYNC -eq 1 ]]; then
+    show "Skipping portage tree update as requested..."
+    return
+  fi
+
+  if command -v eix-sync >/dev/null 2>&1; then
+    show "Updating portage tree via eix-sync..."
+    eix-sync
+  else
+    show "Attempting to update portage tree via emerge-webrsync..."
+    emerge-webrsync || warning "Could not update portage tree via emerge-webrsync"
+
+    show "Finalizing portage tree update via emaint sync --auto..."
+    emaint sync --auto
+  fi
+}
+
+remove_any_prior_emerge_resume_history() {
+  # as if we call emerge --resume later, we don't want any hangovers from the
+  # previous invocation
+  show "Removing any prior emerge history..."
+  emaint --fix cleanresume
+}
+
+# update_all_packages_in_world_set_and_dependencies updates all packages in the
+# @world set and their dependencies.
+update_all_packages_in_world_set_and_dependencies() {
+  show "Updating @world set (for new versions, or changed use flags)..."
+  if ! emerge --deep \
+    --with-bdeps=y --changed-use --update --backtrack=50 @world; then
+    die "Failed to update @world set"
+  fi
+}
+
+# remove_unreferenced_packages removes any packages that are not required by
+# the transitive closure of @world set dependencies.
+remove_unreferenced_packages() {
+  show "Removing packages not required by @world set..."
+  emerge --depclean
+}
+
+rebuild_external_modules_if_necessary() {
+  show "Rebuilding external kernel modules installed by portage..."
+  # exclude packages ending in '-bin'... by convention, these are binary
+  # packages which means they aren't going to rebuild anything
+  # (and may even be binary kernel packages, swept up into the
+  # @module-rebuild set as they 'own' kernel modules in
+  # /lib/modules/<release>/...)
+  if ! emerge @module-rebuild --exclude '*-bin'; then
+    if MAKEOPTS="${MAKEOPTS-} -j1" emerge --resume; then
+      warning "emerge @module-rebuild completed successfully, but only by restricting"
+      warning "build parallelism"
+    else
+      warning "Failed to complete emerge @module-rebuild due to error"
+      warning "Continuing..."
+    fi
+  fi
+}
+
+rebuild_packages_depending_on_stale_libraries() {
+  # when a shared library gets updated, and its soname is changed
+  # all its consumers are not automatically rebuilt; assuming (the default)
+  # that the preserve-libs feature is set, Portage will keep the old
+  # library around (so that the application depending on it will keep working)
+  # the below emerge will rebuild any such consumers, so that the old
+  # library may be freed
+  show "Rebuilding any consumers of old shared libraries, which did not autoupdate..."
+  # do this twice - first, with getbinpkg enabled (as this'll pick up anything
+  # already rebuilt on the binhost, if one is used, saving time) and then again with it
+  # disabled, in case there are any local packages which need rebuilding (and
+  # where we need to suppress getbinpkg, otherwise it'll just re-install from the
+  # local tbz2)
+  if ! emerge @preserved-rebuild; then
+    if MAKEOPTS="${MAKEOPTS-} -j1" emerge --resume; then
+      warning "emerge @preserved-rebuild completed successfully, but only by restricting"
+      warning "build parallelism"
+    else
+      warning "Failed to complete emerge @preserved-rebuild due to error"
+    fi
+  fi
+
+  show "Rebuilding again, with getbinpkg suppressed, to catch any local-only packages..."
+  if ! FEATURES="-getbinpkg" emerge @preserved-rebuild; then
+    if MAKEOPTS="${MAKEOPTS-} -j1" FEATURES="-getbinpkg" emerge --resume; then
+      warning "emerge @preserved-rebuild completed successfully, but only by restricting"
+      warning "build parallelism"
+    else
+      die "Failed to complete emerge @preserved-rebuild due to error"
+    fi
+  fi
+}
+
+bring_old_perl_modules_up_to_date() {
+  # perl modules are built for a particular perl target, but are *not*
+  # automatically rebuilt when perl upgrades to a higher version - the
+  # below script fixes this
+  show "Ensuring perl modules are matched to current version of perl..."
+  perl-cleaner --all
+}
+
+cleanup_python_config() {
+  # remove uninstalled versions from /etc/python-exec/python-exec.conf
+  eselect python cleanup
+}
+
+check_if_dispatch_conf_needs_to_be_run() {
+  # check if the user has any configuration file changes pending review
+  # by dispatch-conf, we do a rough check to see if there are any
+  # pending changes
+  local DIRS_TO_CHECK="$(emerge --info | grep '^CONFIG_PROTECT=' | cut -d"\"" -f2)"
+  local PENDING_CHANGES="$(find ${DIRS_TO_CHECK} -name '*._cfg*' -type f -print)"
+  if [ -n "${PENDING_CHANGES}" ]; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+# interactively_resolve_clashing_config_file_changes allows the user to
+# interactively resolve any clashing configuration file changes.
+interactively_resolve_clashing_config_file_changes() {
+  local NEEDSDISPATCHCONF=0
+  check_if_dispatch_conf_needs_to_be_run || NEEDSDISPATCHCONF=1
+  if [[ $NEEDSDISPATCHCONF == 1 ]]; then
+    dispatch-conf
+  else
+    show "No configuration files need updating"
+  fi
+}
+
+rebuild_where_missing_libraries_detected() {
+  # check for missing shared library dependencies (possibly caused by
+  # emerge --depclean) and attempt to fix them, by re-emerging the broken
+  # libraries and binaries (shouldn't do much nowadays, but good to check!)
+  show "Fixing any broken/missing libraries and binaries caused by cleanup..."
+  revdep-rebuild
+}
+
+purge_old_distfiles() {
+  if ! command -v eclean >/dev/null 2>&1; then
+    show "eclean not installed, skipping purging old distfiles (gentoolkit)"
+    return
+  fi
+
+  # by default, Portage keeps old source tarballs (distfiles) around
+  # forever (in /usr/portage/distfiles); the following command, from the
+  # gentoolkit package, will get rid of any not related to a currently
+  # installed ebuild
+  show "Purging currently unused source tarballs to save space..."
+  eclean --deep distfiles
+}
+
+update_environment() {
+  # append values in /etc/env.d/... files into /etc/profile.env
+  # also create /etc/ld.so.conf, and run ldconfig (to recreate
+  # /etc/ld.so.cache)
+  env-update
+}
+
+update_eix_metadata() {
+  # ensure eix metadata is up-to-date (will not be if
+  # only non-gentoo repos have changed in this run)
+  if ! command -v eix-sync >/dev/null 2>&1; then
+    show "eix not installed, skipping updating eix metadata..."
+    return
+  fi
+
+  # following does not hit the network
+  show "Updating eix metadata..."
+  eix-sync -0 |& sed -e '/^Processing/d'
+}
+
+# update_kernel_if_available checks if a new kernel is available, and if so,
+# asks the user if they want to upgrade to it.
+update_kernel_if_available() {
+  local CURRENT_KV="$(readlink /usr/src/linux)"
+  local LATEST_KV_LINE="$(eselect kernel list | tail -n 1)"
+  local LATEST_KV="$(awk '{print $2}' <<<${LATEST_KV_LINE})"
+  local LATEST_KV_INDEX="$(cut -d '[' -f 2 <<<${LATEST_KV_LINE} | cut -d ']' -f 1)"
+  if ! grep -q '*' <<<"${LATEST_KV_LINE}"; then
+    show "A kernel upgrade is available! You are running ${CURRENT_KV}"
+    if ((ARG_ASK == 0)) || test_yn "Would you like to upgrade to ${LATEST_KV}"; then
+      show "Setting up new kernel in staging..."
+      eselect kernel set "${LATEST_KV_INDEX}"
+
+      if command -v update-m1n1 >/dev/null 2>&1; then
+        show "Updating Apple Silicon specific kernel"
+
+        show "Regenerating initramfs..."
+        dracut --force
+
+        show "Updating grub config..."
+        grub-mkconfig -o /boot/grub/grub.cfg
+
+        show "Updating Apple Silicon firmware..."
+        update-m1n1
+      else
+        warning "buildkernel/genkernel currently not supported. Please build and install manually."
+      fi
+    else
+      show "OK, leaving your kernel as is, to upgrade subsequently, issue:"
+      show "  eselect kernel list"
+      show "  eselect kernel set <n>"
+      show "  dracut"
+      show "  grub-mkconfig -o /boot/grub/grub.cfg"
+      show "  update-m1n1 (Apple Silicon)"
+    fi
+  else
+    show "Your kernel (${CURRENT_KV}) is the latest version available!"
+  fi
+}
+
+# Start of main program flow.
+if [[ $# -ne 0 ]]; then
+  echo "Usage: $(basename "$0")"
+  exit 1
+fi
+
+greeting
+
+# If we're not root, attempt to re-execute ourselves as root.
+if [[ $EUID -ne 0 ]]; then
+  warning "Not running as root, attempting to re-execute as root via sudo..."
+  exec sudo DISPLAYED_GREETING=1 "$0" "$@"
+fi
+
+remove_any_prior_emerge_resume_history
+ensure_portage_itself_is_up_to_date
+update_portage_tree
+update_all_packages_in_world_set_and_dependencies
+remove_unreferenced_packages
+rebuild_external_modules_if_necessary
+rebuild_packages_depending_on_stale_libraries
+bring_old_perl_modules_up_to_date
+cleanup_python_config
+interactively_resolve_clashing_config_file_changes
+update_kernel_if_available
+remove_unreferenced_packages
+
+# See if removing any packages has left any stale libraries
+rebuild_where_missing_libraries_detected
+rebuild_packages_depending_on_stale_libraries
+purge_old_distfiles
+
+# Final steps
+update_environment
+update_eix_metadata
+cleanup_and_exit_with_code 0
