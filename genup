@@ -191,6 +191,11 @@ bring_old_perl_modules_up_to_date() {
 }
 
 cleanup_python_config() {
+  if ! eselect python list >/dev/null 2>&1; then
+    warning "eselect python not available, skipping cleanup"
+    return
+  fi
+
   # remove uninstalled versions from /etc/python-exec/python-exec.conf
   eselect python cleanup
 }
