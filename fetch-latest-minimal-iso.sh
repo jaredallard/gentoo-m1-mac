@@ -20,7 +20,8 @@ SIGNING_KEY_ID="13EBBDBEDE7A12775DFDB1BABB572E0E2D182910"
 
 # GPGHOME is the directory to store GPG data in. We use our own home
 # directory to avoid modifying the user's.
-export GPGHOME="$(pwd)/.gnupg"
+export GPGHOME="$(mktemp -d)"
+trap 'rm -rf $GPGHOME' EXIT
 
 info() {
   echo "$(tput bold)$*$(tput sgr0)"
