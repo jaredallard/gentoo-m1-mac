@@ -12,7 +12,7 @@ fi
 # BASE_URL is the URL to download builds from. This can be changed to
 # use a mirror closer to the current user. Do not include a trailing
 # slash.
-BASE_URL="https://distfiles.gentoo.org/releases/arm64/autobuilds"
+BASE_URL="https://gentoo.rgst.io/gentoo/releases/arm64/autobuilds"
 
 # SIGNING_KEY_ID is the ID of the GPG key used to sign images. This
 # should be changed ONLY if Gentoo has rotated their signing key.
