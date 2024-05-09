@@ -14,10 +14,6 @@ fi
 # slash.
 BASE_URL="https://gentoo.rgst.io/gentoo/releases/arm64/autobuilds"
 
-# SIGNING_KEY_ID is the ID of the GPG key used to sign images. This
-# should be changed ONLY if Gentoo has rotated their signing key.
-SIGNING_KEY_ID="13EBBDBEDE7A12775DFDB1BABB572E0E2D182910"
-
 # GPGHOME is the directory to store GPG data in. We use our own home
 # directory to avoid modifying the user's.
 export GPGHOME="$(mktemp -d)"
@@ -39,6 +35,17 @@ error() {
   echo -e "\033[0;31m$*\033[0m"
 }
 
+if [[ ! -e "/usr/share/openpgp-keys/gentoo-release.asc" ]]; then
+  error "Missing gentoo release keys, are you on a livecd install?" \
+    "(checked /usr/share/openpgp-keys/gentoo-release.asc)"
+  exit 1
+fi
+
+if [[ "$(pwd)" != "/mnt/gentoo" ]]; then
+  error "Must be ran in /mnt/gentoo"
+  exit 1
+fi
+
 if [[ -e "latest-stage3-arm64-desktop-systemd.tar.xz" ]]; then
   error "Image already exists, refusing to continue." \
     "To force a re-download, delete latest-stage3-arm64-desktop-systemd.tar.xz."
@@ -46,9 +53,8 @@ if [[ -e "latest-stage3-arm64-desktop-systemd.tar.xz" ]]; then
 fi
 
 info "Preparing to fetch minimal image"
-info_sub "Fetching GPG key(s)..."
-gpg --keyserver hkps://keys.gentoo.org --recv-keys "$SIGNING_KEY_ID"
-echo -e "trust\n5\ny\n" | gpg --command-fd 0 --edit-key "$SIGNING_KEY_ID" >/dev/null
+info_sub "Ensuring GPG keys are trusted"
+gpg --import /usr/share/openpgp-keys/gentoo-release.asc
 
 info "Determining latest minimal image..."
 tmpFile=$(mktemp)
