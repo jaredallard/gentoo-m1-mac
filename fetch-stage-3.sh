@@ -59,7 +59,7 @@ gpg --import /usr/share/openpgp-keys/gentoo-release.asc
 info "Determining latest minimal image..."
 tmpFile=$(mktemp)
 trap 'rm -f $tmpFile' EXIT
-wget -O "$tmpFile" "$BASE_URL/latest-stage3-arm64-desktop-systemd.txt"
+wget -q -O "$tmpFile" "$BASE_URL/latest-stage3-arm64-desktop-systemd.txt"
 
 info_sub "Checking latest-stage3-arm64-desktop-systemd.txt signature..."
 gpg --verify "$tmpFile" || {
